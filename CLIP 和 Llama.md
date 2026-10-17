@@ -1,8 +1,8 @@
-# CLIP 和 Llama 基础
+# LLaVA：CLIP 和 Llama 基础
 
 LLaVA 受 InstructGPT、LLaMA 等工作中“用指令微调预训练语言模型”的成功启发，探索用**视觉指令微调大型多模态模型**，取得了很好的效果。模型架构上，LLaVA 追求对已有模型的最简单修改，由两个预训练组件构成：**CLIP 预训练的 ViT 图像编码器**和 **LLaMA/Vicuna 等预训练大语言模型（LLM）**。
 
-LLaVA 的核心思路是使用一个投影模块——LLaVA-1.0 中是一个全连接层，LLaVA-1.5 中改为两层 MLP——将 **ViT 输出的 patch/grid 视觉特征**投影到 LLM 的词嵌入空间，作为 vision tokens 与文本 token 拼接。这一模块可简称为**对齐单元**。训练分为两个阶段：
+LLaVA 的核心思路是使用一个投影模块——LLaVA-1.0 中是一个全连接层，LLaVA-1.5 中改为两层 MLP——将 **ViT 输出的 patch/grid 视觉特征**投影到 LLM 的词嵌入空间，作为 vision tokens 与文本 tokens 拼接。这一模块可简称为**对齐单元**。训练分为两个阶段：
 
 - **特征对齐预训练**：冻结 ViT 和 LLM 权重，使用**图像-文本对数据集**训练投影/对齐单元。  
 - **端到端微调**：冻结 ViT 权重，使用**视觉指令数据集**同时调整对齐单元和 LLM 的权重。
@@ -89,14 +89,163 @@ Llava-1.5 使用 Vicuna 的后续版本 v1.5，将基座模型从 Llama 切换�
 
 ### Llama2 模型架构
 
-Llama2 整体架构上依然是 Transformer Decoder，在具体的层中的算法细节中有做改动。我们基于 **GPT-2 对 Transformer Decoder 架构的主要修改：使用可学习位置编码、删除 encoder-decoder 交叉注意力、增加末尾 LayerNorm、所有归一化层改为 pre-norm、使用 GELU 激活和 Dropout**，简要讲解 Llama2 架构。
+Llama2 整体仍是 decoder-only Transformer，在具体的层中的算法细节中有做改动。我们基于 **GPT-2 对 Transformer Decoder 架构的主要修改：使用可学习位置编码、删除 encoder-decoder 交叉注意力、增加末尾 LayerNorm、所有归一化层改为 pre-norm、使用 GELU 激活和 Dropout**，简要讲解 Llama2 架构。
+
+Llama2 架构可以概括为：
+
+\[
+x \leftarrow x+\mathrm{Attn}(\mathrm{RMSNorm}(x))
+\]
+
+\[
+x \leftarrow x+\mathrm{FFN}(\mathrm{RMSNorm}(x))
+\]
+
+\[
+\mathrm{logits}=W_{\text{out}}\,\mathrm{RMSNorm}(x)
+\]
+
 
 下图直观展示了 GPT-2、Llama-2、Llama-3 的架构与差异。图源：`github rasbt/LLMs-from-scratch/ch05/07_gpt_to_llama`
 
 ![gpt2-to-llama2-llama3](img/gpt2-to-llama2-llama3.webp)
 
-Llama-2 对 GPT-2 的主要改动为：
+Llama2-7B 的典型配置是：词表 32k、上下文 4096、隐藏维度 4096、32 层、32 个注意力头、FFN 中间维度 11008，训练/推理常用 bf16。与 GPT-2 相比，Llama2 的主要结构改动集中在**归一化、激活/FFN、位置编码和偏置项**上。
 
-- RMSNorm 替换所有 LayerNorm，可学习参数更少，计算更简单。
-- 线性层使用 SwiGLU 替换原来的 MLP，引入更加复杂的激活函数（门控：随输入变化）。
-- 使用 RoPE 位置编码取代 **加性的位置嵌入**，在注意力层通过乘法作用于向量。
+### RMSNorm
+
+Llama2 用 RMSNorm 替换 LayerNorm。LayerNorm 同时做“减均值”和“除以标准差”，而 RMSNorm 只做均方根缩放，不减均值、通常也不加偏置：
+
+\[
+\mathrm{RMSNorm}(x)=\gamma\odot \frac{x}{\sqrt{\frac{1}{d}\sum_{i=1}^{d}x_i^2+\epsilon}}
+\]
+
+其中 \(\gamma\) 是可学习的缩放向量。这样计算更省，参数更少，也更容易和残差相加融合。在 pre-norm 结构中，残差路径本身较简单，去掉 re-centering 通常不影响稳定性。
+
+### SwiGLU FFN
+
+Llama2 把 GPT-2 的 GELU MLP 换成 SwiGLU 门控 FFN。SwiGLU 使用 SiLU 作为门控激活：
+
+\[
+\mathrm{SiLU}(x)=x\sigma(x)
+\]
+
+\[
+\mathrm{FFN}(x)=\big(\mathrm{SiLU}(xW_g)\odot xW_u\big)W_d
+\]
+
+其中 \(W_g\) 是 gate 投影，\(W_u\) 是 up 投影，\(W_d\) 是 down 投影。相比传统“升维→激活→降维”的 MLP，SwiGLU 多了一个门控分支，因此中间维度通常不取 \(4d\)，而取约 \(\frac{8}{3}d\)，再对齐到硬件友好的数值，Llama2-7B 取 11008。
+
+### RoPE 位置编码
+
+Llama2 不再使用可学习绝对位置嵌入，而是**把位置信息通过旋转注入到注意力层**的 Query/Key 中。把 head 维度分成 \(d/2\) 个二维子空间，每个子空间用不同频率旋转：
+
+\[
+\theta_i=\text{base}^{-2i/d},\qquad i=0,\dots,d/2-1
+\]
+
+\[
+R_{m,i}=
+\begin{pmatrix}
+\cos m\theta_i & -\sin m\theta_i\\
+\sin m\theta_i & \cos m\theta_i
+\end{pmatrix}
+\]
+
+对位置 \(m\) 的 Query 和位置 \(n\) 的 Key：
+
+\[
+q_m=R_mW_qx_m,\qquad k_n=R_nW_kx_n
+\]
+
+由于 \(R_m^TR_n=R_{n-m}\)，注意力分数满足：
+
+\[
+q_m^Tk_n=(W_qx_m)^TR_{n-m}(W_kx_n)
+\]
+
+也就是说，**内积只依赖相对位置 \(n-m\)**。RoPE 不是“加在 embedding 上”的位置编码，而是放在注意力层里对 Q/K 做旋转。Llama2 的 `theta_base` 默认是 10000，Llama3 增大到 500000 以支持更长上下文。
+
+### 注意力与 KV Cache
+
+Llama2 的注意力仍是缩放点积因果自注意力：
+
+\[
+\mathrm{Attn}(X)=\mathrm{softmax}\left(\frac{QK^T}{\sqrt{d_k}}+M\right)V
+\]
+
+其中 \(M\) 是因果 mask。Llama2 的线性层去掉 bias，Q/K/V/O 投影都不带偏置。Llama2-7B/13B 使用传统多头注意力（MHA），34B/70B 使用 GQA。GQA 的详细内容放在 Llama3 讲，本仓库不介绍。
+
+推理时使用 KV Cache：每生成一个新 token，只计算当前 token 的 \(q_t,k_t,v_t\)，把 \(k_t,v_t\) 追加到历史缓存，再用 \(q_t\) 与整个 \(K_{\text{cache}}\) 做注意力，避免重复计算历史 K/V。
+
+### GPT-2 v.s. Llama2 
+
+| 维度 | GPT-2 | Llama2 |
+|---|---|---|
+| 归一化 | LayerNorm | RMSNorm |
+| FFN | GELU MLP | SwiGLU 门控 FFN |
+| 位置编码 | 可学习绝对位置嵌入 | RoPE，旋转注入 Q/K |
+| 注意力 | MHA | 7B/13B MHA；34B/70B GQA |
+| 上下文 | 1024 | 4096 |
+
+## Vicuna 与 LLaVA 所用 LLM
+
+LLaVA-1.5 使用的 LLM 是 Vicuna v1.5，而 **Vicuna 本身是在 LLaMA/LLaMA2 基础上用 ShareGPT 对话数据做指令微调得到的对话模型**。Vicuna 基本不改变 Llama 架构，主要改变的是指令/对话数据分布，因此 Llama2 的结构结论可以直接迁移到 Vicuna。LLaVA 论文的消融显示：Vicuna-v1.5 整体最好，LLaMA2-based 模型一般优于 LLaMA1-based。**语言指令微调会影响多语言和特定任务表现。**
+
+## LLaVA 架构与训练细节
+
+LLaVA 的架构可以概括为：
+
+\[
+\text{image}\rightarrow \text{CLIP ViT}\rightarrow \text{projection}\rightarrow \text{visual tokens}
+\]
+
+\[
+\text{visual tokens}\oplus \text{text tokens}\rightarrow \text{LLM}\rightarrow \text{response}
+\]
+
+LLaVA-1.5 由三部分组成：**CLIP ViT-L/14@336px 视觉编码器**、**两层 MLP 投影层**、**Vicuna v1.5 13B LLM**。LLaVA-1.0 使用单线性投影，LLaVA-1.5 改为两层 MLP。LLaVA 不把视觉特征做成 CLIP 那样的图文相似度匹配，而是把**视觉 token 投影到 LLM 词嵌入空间，作为前缀与文本 token 拼接，由 LLM 自回归生成回答**。
+
+### 视觉特征与投影层
+
+图像经 CLIP ViT 切 patch 后得到 grid patch 特征。**LLaVA 使用 patch 特征，同时不使用 CLS token**。LLaVA-1.5 使用 336×336 输入、patch 14，因此 grid 为 \(24\times24\)，得到 576 个 visual tokens：
+
+\[
+(336/14)^2=576
+\]
+
+投影层把 ViT 的 hidden size 映射到 LLM 的 hidden size。LLaVA-1.0 是单线性层；LLaVA-1.5 是两层 MLP，中间带非线性。**投影层的作用是把视觉特征对齐到 LLM 的词嵌入语义空间，使 LLM 能把 visual tokens 当作一种“视觉词”处理**。
+
+LLaVA-1.5-HD 进一步探索高分辨率：**把高分辨率图像按 224×224 网格切分，每个网格独立送入视觉编码器，得到各自特征图后合并成一张大特征图；同时把一张下采样后的整图特征拼接到合并特征上，提供全局上下文**。后处理包括去掉 padding 对应特征、在每行末尾加特殊 token 以显式标记图像形状、展平后送入 LLM。这样可以把输入扩展到任意分辨率，论文中预定义支持最多 6 个网格，最大约 672×448 或 448×672。全局上下文能缓解 **低分辨率模型却对应需求图像细节指令** 造成的模型幻觉，并帮助模型定位高分辨率特征中的相关区域。
+
+### Visual token 拼接与对话模板
+
+LLaVA 把 visual tokens 放在文本 token 序列前，作为图像前缀；文本侧使用 Vicuna 的对话模板，包含 system/user/assistant 角色标记。原始 LLaVA 用 `<image>` 占位符表示图像位置，训练/推理时把占位符替换为投影后的视觉特征。**对话模板**通常形如：
+
+- system：系统提示；
+- user：用户问题；
+- assistant：模型回答。
+
+训练时通常只对 assistant 回复 token 计算自回归损失，system/user token 不计损失，使模型学习“给定图像和用户指令，生成回答”。推理时从 assistant 起始位置开始自回归生成。
+
+### 两阶段训练
+
+LLaVA 的训练分为两个阶段。
+
+**阶段一：特征对齐预训练。** 冻结 CLIP ViT 和 LLM，只训练投影层。LLaVA-1.5 使用 558K 图文对（公开数据子集），目标是让视觉 token 进入 LLM 词嵌入空间。
+
+**阶段二：视觉指令微调。** 冻结 ViT，训练投影层和 LLM。LLaVA-1.5 使用 665K 视觉指令数据，混合了 LLaVA-Instruct 158K、ShareGPT 40K、VQAv2 83K 等。相比 LLaVA-1.0，LLaVA-1.5 加入了 academic-task-oriented VQA 等数据，并用 **response formatting prompts** 统一输出格式，例如：
+
+- “Answer the question using a single word or phrase.”
+- “Answer with the option's letter from the given choices directly.”
+
+
+这些 prompt 解决了一个关键问题：如果 VQA 数据中既有长回答又有短回答，而 prompt 只写 `Q: ... A:`，LLM 容易行为上过拟合到短答案；明确指定输出格式后，**LLaVA 能在短答案和自然对话之间取得平衡**，便于扩展数据源。
+
+### 推理流程
+
+推理时：
+- 图像→CLIP ViT→投影层→visual tokens
+- 文本按对话模板编码为 token
+- visual tokens 与文本 token 拼接后送入 LLM
+- LLM 自回归生成回答。
